@@ -35,6 +35,14 @@ describe('getUnsupportedCategory', () => {
     it('returns "Microsoft Office" for .docx', () => {
         expect(getUnsupportedCategory('.docx')?.label).toBe('Microsoft Office');
     });
+
+    it('returns null for .pptx (PowerPoint is supported)', () => {
+        expect(getUnsupportedCategory('.pptx')).toBeNull();
+    });
+
+    it('still blocks legacy .ppt', () => {
+        expect(getUnsupportedCategory('.ppt')?.label).toBe('Microsoft Office');
+    });
 });
 
 describe('isExtensionSupported', () => {
@@ -44,6 +52,10 @@ describe('isExtensionSupported', () => {
 
     it('returns true for .py', () => {
         expect(isExtensionSupported('.py')).toBe(true);
+    });
+
+    it('returns true for .pptx', () => {
+        expect(isExtensionSupported('.pptx')).toBe(true);
     });
 
     it('returns false for .exe', () => {
