@@ -699,13 +699,20 @@ Do NOT wrap conversational replies in JSON.
         the parsed tool call if it contains a "tool" key.  Returns None if no
         embedded tool call is found, allowing the caller to treat the response
         as plain text.
+
+        Scanning happens in two passes (issue #1428): the first ignores JSON
+        inside markdown code fences so a real bare tool call wins over a fenced
+        documentation example. If that finds nothing, a second pass *does* scan
+        fenced JSON — some instruct models wrap their actual tool call in a
+        ```json fence, and skipping it lets the loop fall through to the
+        model's hallucinated success text without ever running the tool.
         """
         # Quick check: must contain "tool" to be worth scanning
         if '"tool"' not in response:
             return None
 
         # Build a set of character ranges inside code fences (```...```)
-        # so we don't accidentally extract example JSON from markdown.
+        # so we can prefer a bare tool call over a fenced example.
         _code_ranges: list[tuple[int, int]] = []
         _search_from = 0
         while True:
@@ -723,75 +730,80 @@ Do NOT wrap conversational replies in JSON.
         def _inside_code_fence(pos: int) -> bool:
             return any(start <= pos < end for start, end in _code_ranges)
 
-        # Walk through looking for { that starts a JSON-like block with "tool"
-        idx = 0
-        while idx < len(response):
-            brace_pos = response.find("{", idx)
-            if brace_pos == -1:
-                break
+        def _scan(skip_fenced: bool) -> Optional[Dict[str, Any]]:
+            # Walk through looking for { that starts a JSON-like block with "tool"
+            idx = 0
+            while idx < len(response):
+                brace_pos = response.find("{", idx)
+                if brace_pos == -1:
+                    break
 
-            # Skip JSON inside markdown code fences (example/documentation)
-            if _inside_code_fence(brace_pos):
-                idx = brace_pos + 1
-                continue
-
-            # Look ahead for "tool" near this brace (within 200 chars)
-            look_ahead = response[brace_pos : brace_pos + 200]
-            if '"tool"' not in look_ahead and '"thought"' not in look_ahead:
-                idx = brace_pos + 1
-                continue
-
-            # Use brace-depth matching to find the complete JSON object
-            depth = 0
-            in_str = False
-            escape = False
-            end_pos = brace_pos
-            for j in range(brace_pos, len(response)):
-                ch = response[j]
-                if escape:
-                    escape = False
+                # First pass skips JSON inside markdown code fences so a real
+                # bare tool call is preferred over a fenced documentation example.
+                if skip_fenced and _inside_code_fence(brace_pos):
+                    idx = brace_pos + 1
                     continue
-                if ch == "\\":
-                    escape = True
+
+                # Look ahead for "tool" near this brace (within 200 chars)
+                look_ahead = response[brace_pos : brace_pos + 200]
+                if '"tool"' not in look_ahead and '"thought"' not in look_ahead:
+                    idx = brace_pos + 1
                     continue
-                if ch == '"' and not escape:
-                    in_str = not in_str
-                if not in_str:
-                    if ch == "{":
-                        depth += 1
-                    elif ch == "}":
-                        depth -= 1
-                        if depth == 0:
-                            end_pos = j
-                            break
 
-            if depth != 0:
-                # Unclosed braces — skip
+                # Use brace-depth matching to find the complete JSON object
+                depth = 0
+                in_str = False
+                escape = False
+                end_pos = brace_pos
+                for j in range(brace_pos, len(response)):
+                    ch = response[j]
+                    if escape:
+                        escape = False
+                        continue
+                    if ch == "\\":
+                        escape = True
+                        continue
+                    if ch == '"' and not escape:
+                        in_str = not in_str
+                    if not in_str:
+                        if ch == "{":
+                            depth += 1
+                        elif ch == "}":
+                            depth -= 1
+                            if depth == 0:
+                                end_pos = j
+                                break
+
+                if depth != 0:
+                    # Unclosed braces — skip
+                    idx = brace_pos + 1
+                    continue
+
+                candidate = response[brace_pos : end_pos + 1]
+                try:
+                    # Fix common trailing comma issues
+                    fixed = re.sub(r",\s*}", "}", candidate)
+                    fixed = re.sub(r",\s*]", "]", fixed)
+                    parsed = json.loads(fixed)
+
+                    # Only accept if it has a "tool" key (it's a tool call)
+                    if isinstance(parsed, dict) and "tool" in parsed:
+                        if "tool_args" not in parsed:
+                            parsed["tool_args"] = {}
+                        logger.debug(
+                            f"[PARSE] Extracted embedded tool call: "
+                            f"{parsed.get('tool')} (fenced={not skip_fenced})"
+                        )
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+
                 idx = brace_pos + 1
-                continue
 
-            candidate = response[brace_pos : end_pos + 1]
-            try:
-                # Fix common trailing comma issues
-                fixed = re.sub(r",\s*}", "}", candidate)
-                fixed = re.sub(r",\s*]", "]", fixed)
-                parsed = json.loads(fixed)
+            return None
 
-                # Only accept if it has a "tool" key (it's a tool call)
-                if isinstance(parsed, dict) and "tool" in parsed:
-                    if "tool_args" not in parsed:
-                        parsed["tool_args"] = {}
-                    logger.debug(
-                        f"[PARSE] Extracted embedded tool call: "
-                        f"{parsed.get('tool')}"
-                    )
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-
-            idx = brace_pos + 1
-
-        return None
+        # Prefer a bare tool call; fall back to a fenced one before giving up.
+        return _scan(skip_fenced=True) or _scan(skip_fenced=False)
 
     def _extract_json_from_response(self, response: str) -> Optional[Dict[str, Any]]:
         """

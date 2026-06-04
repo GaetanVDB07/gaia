@@ -495,6 +495,62 @@ def test_parse_legacy_embedded_json_still_works():
 
 
 # =============================================================================
+# Group 3b: Agent._extract_embedded_tool_call — fenced tool calls (#1428)
+# =============================================================================
+
+
+def test_parse_extracts_fenced_tool_call():
+    """Instruct models sometimes wrap their real tool call in a ```json fence
+    surrounded by narration and a fabricated success line. The parser must
+    still extract and execute it instead of returning the hallucinated text
+    (issue #1428 — Agent Builder false-success).
+    """
+    agent = _make_bare_agent(model_id="Qwen3.5-35B-A3B-GGUF")
+    response = (
+        "Creating your Zephyr Agent now! \U0001f389\n\n"
+        "```json\n"
+        '{"tool": "create_agent", "tool_args": {"name": "Zephyr Agent", '
+        '"description": "demo"}}\n'
+        "```\n\n"
+        "✅ **Agent Created!**\n"
+        "File location: `~/.gaia/agents/Zephyr Agent/agent.py`"
+    )
+
+    result = agent._parse_llm_response(response)
+
+    assert result.get("tool") == "create_agent"
+    assert result["tool_args"]["name"] == "Zephyr Agent"
+
+
+def test_parse_prefers_bare_tool_call_over_fenced_example():
+    """A bare tool call must win over a fenced documentation example so we
+    don't regress the original fence-skipping intent."""
+    agent = _make_bare_agent(model_id="Qwen3.5-35B-A3B-GGUF")
+    response = (
+        "For example you could call it like:\n\n"
+        '```json\n{"tool": "delete_everything", "tool_args": {}}\n```\n\n'
+        'But here is the real call: {"tool": "create_agent", '
+        '"tool_args": {"name": "Otter"}}'
+    )
+
+    result = agent._parse_llm_response(response)
+
+    assert result.get("tool") == "create_agent"
+    assert result["tool_args"]["name"] == "Otter"
+
+
+def test_parse_plain_narration_without_tool_stays_conversational():
+    """Pure narration with no tool-call JSON stays a plain answer."""
+    agent = _make_bare_agent(model_id="Qwen3.5-35B-A3B-GGUF")
+    response = "Sure! I can help you build an agent. What should it be called?"
+
+    result = agent._parse_llm_response(response)
+
+    assert "tool" not in result or not result["tool"]
+    assert result["answer"] == response
+
+
+# =============================================================================
 # Group 4: Agent._build_openai_tool_schemas
 # =============================================================================
 
